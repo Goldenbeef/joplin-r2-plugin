@@ -1,6 +1,6 @@
 {
   "name": "joplin-plugin-r2-attachments",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Upload selected attachments directly to Cloudflare R2 and insert public links in Joplin.",
   "type": "module",

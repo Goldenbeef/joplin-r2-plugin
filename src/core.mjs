@@ -23,3 +23,26 @@ export function buildLink(fileName, key, publicBase) {
   const path = key.split('/').map(p => encodeURIComponent(p).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase())).join('/');
   return `[${label}](${publicBase.replace(/\/$/, '')}/${path})`;
 }
+
+/** Normalize an optional allowlist; reject patterns so a typo cannot silently broaden uploads. */
+export function parseExtensions(value) {
+  // 1. Accept comma, Chinese punctuation, semicolon and whitespace separated suffixes.
+  const entries = String(value || '').toLowerCase().split(/[\s,;，；]+/).filter(Boolean).map(s => s.replace(/^[.]/, ''));
+  // 2. Support compound suffixes such as tar.gz; wildcards and file paths are invalid.
+  if (entries.some(s => !/^[a-z0-9]+(?:[.][a-z0-9]+)*$/.test(s))) {
+    throw new Error('文件后缀格式无效，请填写 zip,pdf,7z 或 tar.gz，不要填写通配符或路径。');
+  }
+  return [...new Set(entries)];
+}
+
+/** Reject disallowed files before any file stream or S3 request is created. */
+export function assertAllowedExtension(fileName, value) {
+  // 1. An empty list preserves the original unrestricted manual upload behavior.
+  const extensions = parseExtensions(value);
+  if (!extensions.length) return;
+  // 2. Require a nonempty filename before the full trailing suffix, ignoring letter case.
+  const name = fileName.toLowerCase();
+  if (!extensions.some(ext => name.length > ext.length + 1 && name.endsWith('.' + ext))) {
+    throw new Error('该文件后缀不在 R2 上传列表中，未上传。允许的后缀：' + extensions.join(', '));
+  }
+}

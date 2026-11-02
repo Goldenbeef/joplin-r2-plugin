@@ -3,12 +3,51 @@ import { MenuItemLocation, SettingItemType, ToolbarButtonLocation } from '../api
 import { S3Client } from '@aws-sdk/client-s3';
 import { basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { buildLink, validateSettings } from './core.mjs';
+import { buildLink, validateSettings, assertAllowedExtension } from './core.mjs';
 import { uploadStream } from './upload.mjs';
+import { testConnection } from './connection.mjs';
 
 let activeUpload: AbortController | null = null;
 // Reserve the command while settings and the file dialog are pending, before an upload exists.
 let commandBusy = false;
+let connectionBusy = false;
+let connectionDialog: string;
+
+/** Read saved destination values and construct the same S3 client for uploads and connection checks. */
+async function configuredClient() {
+  // 1. Validate saved settings before contacting any destination or reading a file.
+  const config = validateSettings(await joplin.settings.values(['accountId', 'bucket', 'publicBase', 'accessKeyId', 'secretAccessKey']));
+  // 2. Keep credential-bearing requests on the account-derived S3 endpoint.
+  const client = new S3Client({
+    region: 'auto', endpoint: config.endpoint,
+    credentials: { accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey },
+    maxAttempts: 3, requestChecksumCalculation: 'WHEN_REQUIRED', responseChecksumValidation: 'WHEN_REQUIRED',
+  });
+  return { config, client };
+}
+
+/** Offer a real test button without relying on unsupported settings-button callbacks. */
+async function checkConnection() {
+  // 1. Prevent concurrent test dialogs and explain the temporary public test object before writing it.
+  if (connectionBusy) return;
+  connectionBusy = true;
+  let client: S3Client | undefined;
+  try {
+    const result = await joplin.views.dialogs.open(connectionDialog);
+    if (result.id !== 'confirm') return;
+    // 2. Use saved configuration and always release the SDK connections, including on validation failure.
+    const configured = await configuredClient();
+    client = configured.client;
+    await testConnection(client, configured.config);
+    await joplin.views.dialogs.showMessageBox('测试通过：R2 写入、公开域名下载内容校验、测试文件删除均成功。');
+  } catch (error) {
+    // 3. Helpers return sanitized diagnostics; never display raw SDK request objects or credentials.
+    await joplin.views.dialogs.showMessageBox(error instanceof Error ? error.message : '连通测试失败，请检查配置和网络。');
+  } finally {
+    client?.destroy();
+    connectionBusy = false;
+  }
+}
 
 /** Register the small set of fields needed for one R2 bucket; secrets use Joplin secure storage. */
 async function registerSettings() {
@@ -24,6 +63,7 @@ async function registerSettings() {
     publicBase: field('公开访问地址', ''),
     accessKeyId: field('R2 S3 Access Key ID', '', true),
     secretAccessKey: field('R2 S3 Secret Access Key', '', true),
+    allowedExtensions: { ...field('允许上传 R2 的文件后缀', ''), description: '例如 zip,pdf,7z 或 tar.gz；不区分大小写，留空不限。仅限制插件上传按钮。测试配置请先保存，然后在工具菜单打开 R2 配置连通测试。' },
   });
 }
 
@@ -48,12 +88,14 @@ async function uploadAttachment() {
       return;
     }
     // 2. Reject incomplete configuration before opening or uploading any file.
-    const values = {};
-    for (const key of ['accountId', 'bucket', 'publicBase', 'accessKeyId', 'secretAccessKey']) values[key] = await joplin.settings.value(key);
-    const config = validateSettings(values);
+    const configured = await configuredClient();
+    const config = configured.config;
+    client = configured.client;
     const files = await joplin.views.dialogs.showOpenDialog({ title: '选择要公开上传到 R2 的附件', properties: ['openFile'] });
     if (!files?.length) return;
     const filePath = files[0];
+    // Reject disallowed suffixes before opening a file stream or sending an S3 request.
+    assertAllowedExtension(basename(filePath), await joplin.settings.value('allowedExtensions'));
     const fs = joplin.require('fs-extra');
     const stat = await fs.stat(filePath);
     if (!stat.isFile()) throw new Error('请选择普通文件。');
@@ -62,11 +104,6 @@ async function uploadAttachment() {
     uploadedKey = `attachments/${randomUUID()}/${basename(filePath)}`;
     link = buildLink(basename(filePath), uploadedKey, config.publicBase);
     activeUpload = new AbortController();
-    client = new S3Client({
-      region: 'auto', endpoint: config.endpoint,
-      credentials: { accessKeyId: config.accessKeyId, secretAccessKey: config.secretAccessKey },
-      maxAttempts: 3, requestChecksumCalculation: 'WHEN_REQUIRED', responseChecksumValidation: 'WHEN_REQUIRED',
-    });
     // 4. Show a non-blocking start notification; the same toolbar command can cancel a slow upload.
     await joplin.views.dialogs.showToast({ message: `正在上传 ${basename(filePath)}（${(stat.size / 1048576).toFixed(1)} MiB）；再次点击可取消。`, duration: 5000 });
     await uploadStream(client, config.bucket, uploadedKey, fs.createReadStream(filePath), stat.size, activeUpload.signal);
@@ -105,6 +142,12 @@ joplin.plugins.register({
   onStart: async () => {
     // 1. Register local settings before exposing the upload command.
     await registerSettings();
+    // Create a dedicated dialog: settings APIs expose no custom callback for native Button fields.
+    connectionDialog = await joplin.views.dialogs.create('r2ConnectionTest');
+    await joplin.views.dialogs.setHtml(connectionDialog, '<h2>R2 配置连通测试</h2><p>请先保存插件设置。点击测试将使用已保存的配置，上传少量无敏感内容的测试文本，通过公开域名核对内容后删除测试文件。不会读取笔记或附件。</p><p>测试最长约 40 秒；若清理失败，将显示需手动删除的测试对象路径。</p>');
+    await joplin.views.dialogs.setButtons(connectionDialog, [{ id: 'confirm', title: '测试连通' }, { id: 'cancel', title: '取消' }]);
+    await joplin.commands.register({ name: 'testPublicR2Connection', label: 'R2 配置连通测试', execute: checkConnection });
+    await joplin.views.menuItems.create('publicR2ConnectionMenu', 'testPublicR2Connection', MenuItemLocation.Tools);
     // 2. Keep upload restricted to editable Markdown notes; other clients can still open the resulting HTTPS link.
     await joplin.commands.register({
       name: 'uploadPublicR2Attachment', label: '上传公开附件到 R2（再次点击取消）', iconName: 'fas fa-cloud-upload-alt',
