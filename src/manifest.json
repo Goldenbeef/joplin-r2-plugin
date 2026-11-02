@@ -1,0 +1,21 @@
+{
+  "manifest_version": 1,
+  "id": "local.r2.publicattachments",
+  "app_min_version": "3.7",
+  "platforms": [
+    "desktop"
+  ],
+  "version": "0.1.0",
+  "name": "R2 公开附件",
+  "description": "选择文件直传 Cloudflare R2，并在当前笔记插入公开链接；正文仍使用原同步目标。",
+  "author": "R2 Attachments Contributors",
+  "keywords": [
+    "r2",
+    "attachments",
+    "s3"
+  ],
+  "categories": [
+    "files",
+    "integrations"
+  ]
+}

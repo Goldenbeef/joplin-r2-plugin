@@ -1,0 +1,21 @@
+{
+  "name": "joplin-plugin-r2-attachments",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Upload selected attachments directly to Cloudflare R2 and insert public links in Joplin.",
+  "type": "module",
+  "keywords": [
+    "joplin-plugin"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "dist": "node scripts/build.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1161.0",
+    "@aws-sdk/lib-storage": "3.1161.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

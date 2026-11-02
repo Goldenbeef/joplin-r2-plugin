@@ -1,0 +1,11 @@
+node_modules/
+dist/
+publish/
+*.log
+
+# macOS metadata and local credentials must never enter the public repository.
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
