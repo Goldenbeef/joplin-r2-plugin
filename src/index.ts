@@ -1,9 +1,9 @@
 import joplin from '../api';
-import { MenuItemLocation, SettingItemType, ToolbarButtonLocation } from '../api/types';
+import { ContentScriptType, MenuItemLocation, SettingItemType, ToolbarButtonLocation } from '../api/types';
 import { S3Client } from '@aws-sdk/client-s3';
 import { basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { buildLink, validateSettings, assertAllowedExtension } from './core.mjs';
+import { buildLink, validateSettings, assertAllowedExtension, parseExtensions } from './core.mjs';
 import { uploadStream } from './upload.mjs';
 import { testConnection } from './connection.mjs';
 
@@ -63,20 +63,25 @@ async function registerSettings() {
     publicBase: field('公开访问地址', ''),
     accessKeyId: field('R2 S3 Access Key ID', '', true),
     secretAccessKey: field('R2 S3 Secret Access Key', '', true),
-    allowedExtensions: { ...field('允许上传 R2 的文件后缀', ''), description: '例如 zip,pdf,7z 或 tar.gz；不区分大小写，留空不限。仅限制插件上传按钮。测试配置请先保存，然后在工具菜单打开 R2 配置连通测试。' },
+    allowedExtensions: { ...field('自动上传 R2 的文件后缀', ''), description: '例如 zip,pdf,7z 或 tar.gz；不区分大小写。匹配的拖入文件上传 R2，其余走原附件流程；留空不接管拖拽。手动上传按钮仍为留空不限。' },
   });
 }
 
 /** Upload one explicitly selected file and insert its link only into the original selected note. */
-async function uploadAttachment() {
+async function uploadAttachment(droppedPath?: string) {
   // 1. Re-running this command during an upload gives a cancellation option, never a duplicate upload.
   if (activeUpload) {
+    // A concurrent drop must not accidentally invoke the manual cancellation dialog.
+    if (droppedPath) throw new Error('已有文件正在上传，本次文件未上传，请稍后重新拖入。');
     const uploadToCancel = activeUpload;
     if (await joplin.views.dialogs.showMessageBox('文件正在上传，是否取消本次上传？') === 0) uploadToCancel.abort();
     return;
   }
   // Reserve synchronously so repeated clicks cannot open overlapping file dialogs.
-  if (commandBusy) return;
+  if (commandBusy) {
+    if (droppedPath) throw new Error('上传命令正在准备，请稍后重新拖入。');
+    return;
+  }
   commandBusy = true;
   let client: S3Client | undefined;
   let link = '';
@@ -91,7 +96,7 @@ async function uploadAttachment() {
     const configured = await configuredClient();
     const config = configured.config;
     client = configured.client;
-    const files = await joplin.views.dialogs.showOpenDialog({ title: '选择要公开上传到 R2 的附件', properties: ['openFile'] });
+    const files = droppedPath ? [droppedPath] : await joplin.views.dialogs.showOpenDialog({ title: '选择要公开上传到 R2 的附件', properties: ['openFile'] });
     if (!files?.length) return;
     const filePath = files[0];
     // Reject disallowed suffixes before opening a file stream or sending an S3 request.
@@ -107,6 +112,8 @@ async function uploadAttachment() {
     // 4. Show a non-blocking start notification; the same toolbar command can cancel a slow upload.
     await joplin.views.dialogs.showToast({ message: `正在上传 ${basename(filePath)}（${(stat.size / 1048576).toFixed(1)} MiB）；再次点击可取消。`, duration: 5000 });
     await uploadStream(client, config.bucket, uploadedKey, fs.createReadStream(filePath), stat.size, activeUpload.signal);
+    // The originating editor owns the drop anchor and note-session checks, so it performs insertion.
+    if (droppedPath) return { link };
     // 5. Do not append to a different note if the user navigated away while the upload was running.
     const current = await joplin.workspace.selectedNote();
     if (current?.id !== selected.id) {
@@ -142,6 +149,19 @@ joplin.plugins.register({
   onStart: async () => {
     // 1. Register local settings before exposing the upload command.
     await registerSettings();
+    // Register the script before attaching its message bridge; secrets remain inside the plugin process.
+    await joplin.contentScripts.register(ContentScriptType.CodeMirrorPlugin, 'r2DropRouting', './contentScript.js');
+    await joplin.contentScripts.onMessage('r2DropRouting', async message => {
+      // 1. Return only normalized routing rules; never expose account settings or credentials to editors.
+      if (message?.type === 'dropRules') return parseExtensions(await joplin.settings.value('allowedExtensions'));
+      if (message?.type === 'dropUpload' && typeof message.path === 'string') return uploadAttachment(message.path);
+      // 2. Preserve completed links when the originating editor was closed or switched to another note.
+      if (message?.type === 'copyLink' && typeof message.link === 'string') {
+        await joplin.clipboard.writeText(message.link);
+        await joplin.views.dialogs.showMessageBox('R2 上传已完成，但原笔记已切换或关闭。链接已复制，请手动粘贴。');
+      }
+      if (message?.type === 'dropError') await joplin.views.dialogs.showMessageBox(message.message || '拖入文件失败，请重试。');
+    });
     // Create a dedicated dialog: settings APIs expose no custom callback for native Button fields.
     connectionDialog = await joplin.views.dialogs.create('r2ConnectionTest');
     await joplin.views.dialogs.setHtml(connectionDialog, '<h2>R2 配置连通测试</h2><p>请先保存插件设置。点击测试将使用已保存的配置，上传少量无敏感内容的测试文本，通过公开域名核对内容后删除测试文件。不会读取笔记或附件。</p><p>测试最长约 40 秒；若清理失败，将显示需手动删除的测试对象路径。</p>');
